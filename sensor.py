@@ -25,11 +25,13 @@ class C2B(nn.Module):
         # self.code_repeat = code.repeat(1, 1, patch_size//block_size, patch_size//block_size)
 
 
-    def forward(self, x):
+    def forward(self, x, two_bucket=False):
 
-        # code_repeat_comp = 1 - self.code_repeat
         code_repeat = self.code.repeat(1, 1, self.patch_size//self.block_size, self.patch_size//self.block_size)
         b1 = torch.sum(code_repeat*x, dim=1, keepdim=True) / torch.sum(code_repeat, dim=1, keepdim=True)
-        # b0 = torch.sum(code_repeat_comp*x, dim=1, keepdim=True) / torch.sum(code_repeat_comp, dim=1, keepdim=True)
-        # blurred = torch.mean(x, dim=1, keepdim=True)
-        return b1 # (N,1,H,W)
+        if not two_bucket:
+            return b1
+        code_repeat_comp = 1 - code_repeat
+        b0 = torch.sum(code_repeat_comp*x, dim=1, keepdim=True) / torch.sum(code_repeat_comp, dim=1, keepdim=True)
+        blurred = torch.mean(x, dim=1, keepdim=True)
+        return b1, b0, blurred # (N,1,H,W)

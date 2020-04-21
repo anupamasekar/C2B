@@ -38,7 +38,13 @@ def gradxy(tensor):
 
 def weighted_L2loss(pred, target):
     grad_weight = gradxy(target).abs() + 1.
-    loss = ((pred - target) * grad_weight).pow(2).mean()
+    loss = ((pred - target)*grad_weight).pow(2).mean()
+    return loss
+
+
+def weighted_L1loss(pred, target):
+    grad_weight = gradxy(target).abs() + 1.
+    loss = ((pred-target)*grad_weight).abs().mean()
     return loss
 
 
@@ -260,14 +266,17 @@ def save_image(img, path, normalize=False):
     return
 
 
-def save_gif(np_arr, path):
+def save_gif(arr, path, normalize=False):
     # (9,H,W)
     frames = []
-    for sub_frame in range(np_arr.shape[0]):
-        img = np_arr[sub_frame,...]
+    for sub_frame in range(arr.shape[0]):
+        img = arr[sub_frame,...]
+        # print(np.amax(img), np.amin(img))
+        if normalize:
+            img = (img - np.amin(img)) / (np.amax(img) - np.amin(img))
         img = img.clip(0,1)
         img = Image.fromarray((img*255.).astype('uint8'))
         frames.append(img)
     frame1 = frames[0]
-    frame1.save(path, save_all=True, append_images=frames[1:], duration=300, loop=0)
+    frame1.save(path, save_all=True, append_images=frames[1:], duration=500, loop=0)
     return

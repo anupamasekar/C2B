@@ -24,7 +24,6 @@ from logger import Logger
 from dataloader_v4 import Dataset_load
 from sensor import C2B
 from unet_v3 import UNet
-# from unet_model import UNet
 from shift_var_conv import ShiftVarConv2D
 import utils
 
@@ -100,12 +99,11 @@ logging.info('Loaded validation set: %d videos'%(len(validation_set)))
 
 ## initialize nets
 c2b = C2B(block_size=args.blocksize, sub_frames=args.subframes, patch_size=args.patchsize).cuda()
-invNet = ShiftVarConv2D(out_channels=args.subframes, block_size=args.blocksize).cuda()
-uNet = UNet(in_channel=args.subframes, out_channel=args.subframes, instance_norm=True).cuda()
-# uNet = UNet(n_channels=16, n_classes=16).cuda()
+invNet = ShiftVarConv2D(out_channels=args.subframes, block_size=args.blocksize, two_bucket=True).cuda()
+netG = UNet(in_channel=args.subframes, out_channel=args.subframes, batch_norm=False).cuda()
 
 ## optimizer
-optimizer = torch.optim.Adam(list(invNet.parameters()) + list(uNet.parameters()),
+optimizer = torch.optim.Adam(list(invNet.parameters()) + list(netG.parameters()),
                              lr=lr, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, 
                                                         patience=5, min_lr=1e-6, verbose=True)
@@ -120,8 +118,8 @@ elif args.ckptpath is None:
     c2b.train()
     invNet.load_state_dict(ckpt['invnet_state_dict'])
     invNet.train()
-    uNet.load_state_dict(ckpt['unet_state_dict'])
-    uNet.train()
+    netG.load_state_dict(ckpt['unet_state_dict'])
+    netG.train()
     optimizer.load_state_dict(ckpt['opt_state_dict'])
     start_epoch = ckpt['epoch'] + 1
     logging.info('Loaded checkpoint from epoch %d'%(start_epoch-1))
@@ -135,14 +133,15 @@ else:
         invNet.load_state_dict(ckpt['invnet_state_dict'])
         invNet.train()
     if 'unet_state_dict' in ckpt:
-        uNet.load_state_dict(ckpt['unet_state_dict'])
-        uNet.train()
+        netG.load_state_dict(ckpt['unet_state_dict'])
+        netG.train()
     start_epoch = 0
     logging.info('Loaded checkpoint %d from %s'%(ckpt['epoch'], ckpt_path))
 torch.save(c2b.code, os.path.join(save_path, 'model', 'exposure_code.pth'))
 
 ## define losses
 # L1loss = nn.L1Loss()
+
 
 logging.info('Starting training')
 for i in range(start_epoch, start_epoch+num_epochs):
@@ -154,22 +153,21 @@ for i in range(start_epoch, start_epoch+num_epochs):
     tv_loss_sum = 0.
     loss_sum = 0.
     psnr_sum = 0.
+
+
     for gt_vid in training_generator:   
 
         gt_vid = gt_vid.cuda()
 
-        b1 = c2b(gt_vid) # (N,1,H,W)
-        interm_vid = invNet(b1)        
-        highres_vid = uNet(interm_vid) # (N,9,H,W)
+        b1, b0, blurred = c2b(gt_vid, two_bucket=True) # (N,1,H,W)
+        b10 = torch.cat([b1, b0], dim=1)
+        interm_vid = invNet(b10)        
+        highres_vid = netG(interm_vid) # (N,9,H,W)
         psnr_sum += utils.compute_psnr(highres_vid, gt_vid).item()
 
         ## LOSSES
-        b1_est = c2b(interm_vid)
-        interm_loss = utils.weighted_L1loss(b1_est, b1)
-        # blurred = torch.mean(gt_vid, dim=1, keepdim=True)
-        # blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
-        # interm_loss = L1loss(blurred_est, blurred)
-        # interm_loss = utils.weighted_L1loss(interm_vid, gt_vid)
+        blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
+        interm_loss = utils.weighted_L1loss(blurred_est, blurred)
         interm_loss_sum += interm_loss.item()
 
         final_loss = utils.weighted_L1loss(highres_vid, gt_vid)
@@ -179,7 +177,6 @@ for i in range(start_epoch, start_epoch+num_epochs):
         tv_loss_sum += tv_loss.item()
 
         loss = final_loss + 0.1*tv_loss + interm_loss
-        # loss = final_loss + 0.1*tv_loss
         loss_sum += loss.item()
 
         ## BACKPROP
@@ -190,7 +187,7 @@ for i in range(start_epoch, start_epoch+num_epochs):
         if train_iter % 100 == 0:
             logging.info('epoch: %3d \t iter: %5d \t loss: %.4f'%(i, train_iter, loss.item()))
             # print(l1_interm_loss.item(), l1_final_loss.item(), tv_loss.item())
-        if (i % 5 == 0) and (train_iter % 500 == 0):
+        if train_iter % 500 == 0:
             highres_np = highres_vid[0,...].data.cpu().numpy()
             interm_np = interm_vid[0,...].data.cpu().numpy()
             gt_np = gt_vid[0,...].data.cpu().numpy()
@@ -219,44 +216,36 @@ for i in range(start_epoch, start_epoch+num_epochs):
 
 
     ## VALIDATION
-    if ((i+1) % 2 == 0) or ((i+1) == (start_epoch+num_epochs)):        
+    if ((i+1) % 2 == 0) or ((i+1) == (start_epoch+num_epochs)):
+        
         logging.info('Starting validation')
         val_iter = 0
         val_loss_sum = 0.
         val_psnr_sum = 0.
         val_ssim_sum = 0.
-        invNet.eval()
-        uNet.eval()
+
         with torch.no_grad():
             for gt_vid in validation_generator:
                 
                 gt_vid = gt_vid.cuda()
                 
-                b1 = c2b(gt_vid) # (N,1,H,W)
-                interm_vid = invNet(b1)               
-                highres_vid = uNet(interm_vid) # (N,9,H,W)
+                b1, b0, blurred = c2b(gt_vid, two_bucket=True) # (N,1,H,W)
+                b10 = torch.cat([b1, b0], dim=1)
+                interm_vid = invNet(b10)               
+                highres_vid = netG(interm_vid) # (N,9,H,W)
 
                 val_psnr_sum += utils.compute_psnr(highres_vid, gt_vid).item()
                 val_ssim_sum += utils.compute_ssim(highres_vid, gt_vid).item()
-                
-                psnr = utils.compute_psnr(highres_vid, gt_vid).item() / gt_vid.shape[0]
-                ssim = utils.compute_ssim(highres_vid, gt_vid).item() / gt_vid.shape[0]
-                print('PSNR: %.2f SSIM: %.3f'%(psnr, ssim))
-
+                    
                 ## loss
-                b1_est = c2b(interm_vid)
-                interm_loss = utils.weighted_L1loss(b1_est, b1)
-                # blurred = torch.mean(gt_vid, dim=1, keepdim=True)
-                # blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
-                # interm_loss = L1loss(blurred_est, blurred)
-                # interm_loss = utils.weighted_L1loss(interm_vid, gt_vid)
+                blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
+                interm_loss = utils.weighted_L1loss(blurred_est, blurred)
                 
                 final_loss = utils.weighted_L1loss(highres_vid, gt_vid)
                 
                 tv_loss = utils.gradx(highres_vid).abs().mean() + utils.grady(highres_vid).abs().mean()
 
                 val_loss_sum += (interm_loss + final_loss + 0.1*tv_loss).item()
-                # val_loss_sum += (final_loss + 0.1*tv_loss).item()
 
                 if val_iter % 100 == 0:
                     print('In val iter %d'%(val_iter))
@@ -267,21 +256,19 @@ for i in range(start_epoch, start_epoch+num_epochs):
         logging.info('Finished validation with loss: %.4f psnr: %.4f ssim: %.4f'
                     %(val_loss_sum/val_iter, val_psnr_sum/len(validation_set), val_ssim_sum/len(validation_set)))
 
-        scheduler.step(val_loss_sum/val_iter)
-        invNet.train()
-        uNet.train()
-        
+
         ## dump tensorboard summaries
         logger.scalar_summary(tag='validation/loss', value=val_loss_sum/val_iter, step=i)
         logger.scalar_summary(tag='validation/psnr', value=val_psnr_sum/len(validation_set), step=i)
         logger.scalar_summary(tag='validation/ssim', value=val_ssim_sum/len(validation_set), step=i)
 
+        scheduler.step(val_loss_sum/val_iter)
     
     ## CHECKPOINT
     if ((i+1) % 10 == 0) or ((i+1) == (start_epoch+num_epochs)):
         utils.save_checkpoint(state={'epoch': i, 
                                     'invnet_state_dict': invNet.state_dict(),
-                                    'unet_state_dict': uNet.state_dict(),
+                                    'unet_state_dict': netG.state_dict(),
                                     'c2b_state_dict': c2b.state_dict(),
                                     'opt_state_dict': optimizer.state_dict()},
                             save_path=os.path.join(save_path, 'model'),

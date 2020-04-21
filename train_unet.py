@@ -23,9 +23,9 @@ np.random.seed(12)
 from logger import Logger
 from dataloader_v4 import Dataset_load
 from sensor import C2B
-from unet_v3 import UNet
-# from unet_model import UNet
-from shift_var_conv import ShiftVarConv2D
+# from unet_v3 import UNet
+from unet_model import UNet
+# from shift_var_conv import ShiftVarConv2D
 import utils
 
 
@@ -100,13 +100,12 @@ logging.info('Loaded validation set: %d videos'%(len(validation_set)))
 
 ## initialize nets
 c2b = C2B(block_size=args.blocksize, sub_frames=args.subframes, patch_size=args.patchsize).cuda()
-invNet = ShiftVarConv2D(out_channels=args.subframes, block_size=args.blocksize).cuda()
-uNet = UNet(in_channel=args.subframes, out_channel=args.subframes, instance_norm=True).cuda()
-# uNet = UNet(n_channels=16, n_classes=16).cuda()
+# invNet = ShiftVarConv2D(out_channels=args.subframes, block_size=args.blocksize).cuda()
+# uNet = UNet(in_channel=1, out_channel=args.subframes, instance_norm=False).cuda()
+uNet = UNet(n_channels=1, n_classes=16).cuda()
 
 ## optimizer
-optimizer = torch.optim.Adam(list(invNet.parameters()) + list(uNet.parameters()),
-                             lr=lr, weight_decay=1e-5)
+optimizer = torch.optim.Adam(list(uNet.parameters()), lr=lr, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, 
                                                         patience=5, min_lr=1e-6, verbose=True)
 
@@ -154,32 +153,25 @@ for i in range(start_epoch, start_epoch+num_epochs):
     tv_loss_sum = 0.
     loss_sum = 0.
     psnr_sum = 0.
+
+
     for gt_vid in training_generator:   
 
         gt_vid = gt_vid.cuda()
 
         b1 = c2b(gt_vid) # (N,1,H,W)
-        interm_vid = invNet(b1)        
-        highres_vid = uNet(interm_vid) # (N,9,H,W)
+        highres_vid = uNet(b1) # (N,9,H,W)
+        
         psnr_sum += utils.compute_psnr(highres_vid, gt_vid).item()
 
         ## LOSSES
-        b1_est = c2b(interm_vid)
-        interm_loss = utils.weighted_L1loss(b1_est, b1)
-        # blurred = torch.mean(gt_vid, dim=1, keepdim=True)
-        # blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
-        # interm_loss = L1loss(blurred_est, blurred)
-        # interm_loss = utils.weighted_L1loss(interm_vid, gt_vid)
-        interm_loss_sum += interm_loss.item()
-
         final_loss = utils.weighted_L1loss(highres_vid, gt_vid)
         final_loss_sum += final_loss.item()
 
         tv_loss = utils.gradx(highres_vid).abs().mean() + utils.grady(highres_vid).abs().mean()
         tv_loss_sum += tv_loss.item()
 
-        loss = final_loss + 0.1*tv_loss + interm_loss
-        # loss = final_loss + 0.1*tv_loss
+        loss = final_loss + 0.1*tv_loss
         loss_sum += loss.item()
 
         ## BACKPROP
@@ -192,12 +184,12 @@ for i in range(start_epoch, start_epoch+num_epochs):
             # print(l1_interm_loss.item(), l1_final_loss.item(), tv_loss.item())
         if (i % 5 == 0) and (train_iter % 500 == 0):
             highres_np = highres_vid[0,...].data.cpu().numpy()
-            interm_np = interm_vid[0,...].data.cpu().numpy()
+            # interm_np = interm_vid[0,...].data.cpu().numpy()
             gt_np = gt_vid[0,...].data.cpu().numpy()
             # for frame in range(gt_np.shape[0]):
             #     utils.save_image(interm_np[frame,...], 
             #                     os.path.join(save_path, 'images', 'interm_%.3d_%.5d_%.2d.png'%(i, train_iter, frame)))
-            utils.save_gif(interm_np, os.path.join(save_path, 'gifs', 'interm_%.3d_%.5d.gif'%(i, train_iter)))            
+            # utils.save_gif(interm_np, os.path.join(save_path, 'gifs', 'interm_%.3d_%.5d.gif'%(i, train_iter)))            
             utils.save_gif(highres_np, os.path.join(save_path, 'gifs', 'highres_%.3d_%.5d.gif'%(i, train_iter)))
             utils.save_gif(gt_np, os.path.join(save_path, 'gifs', 'gt_%.3d_%.5d.gif'%(i, train_iter)))
 
@@ -219,13 +211,13 @@ for i in range(start_epoch, start_epoch+num_epochs):
 
 
     ## VALIDATION
-    if ((i+1) % 2 == 0) or ((i+1) == (start_epoch+num_epochs)):        
+    if ((i+1) % 2 == 0) or ((i+1) == (start_epoch+num_epochs)):
+        
         logging.info('Starting validation')
         val_iter = 0
         val_loss_sum = 0.
         val_psnr_sum = 0.
         val_ssim_sum = 0.
-        invNet.eval()
         uNet.eval()
         with torch.no_grad():
             for gt_vid in validation_generator:
@@ -233,30 +225,15 @@ for i in range(start_epoch, start_epoch+num_epochs):
                 gt_vid = gt_vid.cuda()
                 
                 b1 = c2b(gt_vid) # (N,1,H,W)
-                interm_vid = invNet(b1)               
-                highres_vid = uNet(interm_vid) # (N,9,H,W)
+                highres_vid = uNet(b1) # (N,9,H,W)
 
                 val_psnr_sum += utils.compute_psnr(highres_vid, gt_vid).item()
                 val_ssim_sum += utils.compute_ssim(highres_vid, gt_vid).item()
-                
-                psnr = utils.compute_psnr(highres_vid, gt_vid).item() / gt_vid.shape[0]
-                ssim = utils.compute_ssim(highres_vid, gt_vid).item() / gt_vid.shape[0]
-                print('PSNR: %.2f SSIM: %.3f'%(psnr, ssim))
-
+                    
                 ## loss
-                b1_est = c2b(interm_vid)
-                interm_loss = utils.weighted_L1loss(b1_est, b1)
-                # blurred = torch.mean(gt_vid, dim=1, keepdim=True)
-                # blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
-                # interm_loss = L1loss(blurred_est, blurred)
-                # interm_loss = utils.weighted_L1loss(interm_vid, gt_vid)
-                
                 final_loss = utils.weighted_L1loss(highres_vid, gt_vid)
-                
                 tv_loss = utils.gradx(highres_vid).abs().mean() + utils.grady(highres_vid).abs().mean()
-
-                val_loss_sum += (interm_loss + final_loss + 0.1*tv_loss).item()
-                # val_loss_sum += (final_loss + 0.1*tv_loss).item()
+                val_loss_sum += (final_loss + 0.1*tv_loss).item()
 
                 if val_iter % 100 == 0:
                     print('In val iter %d'%(val_iter))
@@ -268,19 +245,19 @@ for i in range(start_epoch, start_epoch+num_epochs):
                     %(val_loss_sum/val_iter, val_psnr_sum/len(validation_set), val_ssim_sum/len(validation_set)))
 
         scheduler.step(val_loss_sum/val_iter)
-        invNet.train()
         uNet.train()
-        
+
         ## dump tensorboard summaries
         logger.scalar_summary(tag='validation/loss', value=val_loss_sum/val_iter, step=i)
         logger.scalar_summary(tag='validation/psnr', value=val_psnr_sum/len(validation_set), step=i)
         logger.scalar_summary(tag='validation/ssim', value=val_ssim_sum/len(validation_set), step=i)
 
+        scheduler.step(val_loss_sum/val_iter)
     
     ## CHECKPOINT
     if ((i+1) % 10 == 0) or ((i+1) == (start_epoch+num_epochs)):
         utils.save_checkpoint(state={'epoch': i, 
-                                    'invnet_state_dict': invNet.state_dict(),
+                                    # 'invnet_state_dict': invNet.state_dict(),
                                     'unet_state_dict': uNet.state_dict(),
                                     'c2b_state_dict': c2b.state_dict(),
                                     'opt_state_dict': optimizer.state_dict()},
