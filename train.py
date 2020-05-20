@@ -7,6 +7,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import logging
 import glob
 import argparse
@@ -32,17 +33,16 @@ import utils
 ## parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('--expt', type=str, required=True, help='expt name')
-parser.add_argument('--epochs', type=int, default=200, help='num epochs to train')
+parser.add_argument('--epochs', type=int, default=500, help='num epochs to train')
 parser.add_argument('--batch', type=int, required=True, help='batch size for training and validation')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
-# parser.add_argument('--code', type=str, default='seq', help='code to use for c2b "rand" or "seq"')
 parser.add_argument('--blocksize', type=int, default=8, help='tile size for code default 3x3')
 parser.add_argument('--subframes', type=int, default=16, help='num sub frames')
 parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to load')
 parser.add_argument('--ckptpath', type=str, default=None, help='load ckpt from another expt')
-parser.add_argument('--patchsize', type=int, default=128, help='size of image patches')
-# parser.add_argument('--npatches', type=int, default=5, help='num of patches to take from each input vid')
 parser.add_argument('--gpu', type=str, required=True, help='GPU ID')
+parser.add_argument('--mask', type=str, default='random', help='"impulse" or "random" or "opt"')
+parser.add_argument('--two_bucket', action='store_true', help="1 bucket or 2 buckets")
 args = parser.parse_args()
 # print(args)
 
@@ -62,7 +62,7 @@ val_params = {'batch_size': args.batch,
 lr = args.lr
 num_epochs = args.epochs
 
-save_path = os.path.join('/media/data/prasan/C2B/anupama/', args.expt)
+save_path = os.path.join('/data/prasan/anupama/', args.expt)
 utils.create_dirs(save_path)
 
 
@@ -85,23 +85,24 @@ logging.info(args)
 
 
 ## dataloaders using hdf5 file
-data_path = '/media/data/prasan/C2B/anupama/dataset/GoPro_patches_ds2_s16-8_p128-64.hdf5'
+data_path = '/data/prasan/anupama/dataset/GoPro_patches_ds2_s16-8_p64-32.hdf5'
+
 
 ## initializing training and validation data generators
 training_set = Dataset_load(data_path, dataset='train', num_samples='all')
 training_generator = data.DataLoader(training_set, **train_params)
 logging.info('Loaded training set: %d videos'%(len(training_set)))
 
-validation_set = Dataset_load(data_path, dataset='test', num_samples=12000)
+validation_set = Dataset_load(data_path, dataset='test', num_samples=60000)
 validation_generator = data.DataLoader(validation_set, **val_params)
 logging.info('Loaded validation set: %d videos'%(len(validation_set)))
 
 
 
 ## initialize nets
-c2b = C2B(block_size=args.blocksize, sub_frames=args.subframes, patch_size=args.patchsize).cuda()
-invNet = ShiftVarConv2D(out_channels=args.subframes, block_size=args.blocksize).cuda()
-uNet = UNet(in_channel=args.subframes, out_channel=args.subframes, instance_norm=True).cuda()
+c2b = C2B(block_size=args.blocksize, sub_frames=args.subframes, mask=args.mask, two_bucket=args.two_bucket).cuda()
+invNet = ShiftVarConv2D(out_channels=args.subframes, block_size=args.blocksize, two_bucket=args.two_bucket).cuda()
+uNet = UNet(in_channel=args.subframes, out_channel=args.subframes, instance_norm=False).cuda()
 # uNet = UNet(n_channels=16, n_classes=16).cuda()
 
 ## optimizer
@@ -126,7 +127,7 @@ elif args.ckptpath is None:
     start_epoch = ckpt['epoch'] + 1
     logging.info('Loaded checkpoint from epoch %d'%(start_epoch-1))
 else:
-    ckpt_path = os.path.join('/media/data/prasan/C2B/anupama/', args.ckptpath, 'model', args.ckpt)
+    ckpt_path = os.path.join('/data/prasan/anupama/', args.ckptpath, 'model', args.ckpt)
     ckpt = torch.load(ckpt_path)
     if 'c2b_state_dict' in ckpt:
         c2b.load_state_dict(ckpt['c2b_state_dict'])
@@ -157,19 +158,23 @@ for i in range(start_epoch, start_epoch+num_epochs):
     for gt_vid in training_generator:   
 
         gt_vid = gt_vid.cuda()
-
-        b1 = c2b(gt_vid) # (N,1,H,W)
-        interm_vid = invNet(b1)        
-        highres_vid = uNet(interm_vid) # (N,9,H,W)
+        if not args.two_bucket:
+            b1 = c2b(gt_vid) # (N,1,H,W)
+            interm_vid = invNet(b1)  
+        else:
+            b1, b0 = c2b(gt_vid)
+            interm_vid = invNet(torch.cat([b1,b0], dim=1))
+        highres_vid = uNet(interm_vid) # (N,16,H,W)
+        
         psnr_sum += utils.compute_psnr(highres_vid, gt_vid).item()
 
         ## LOSSES
-        b1_est = c2b(interm_vid)
-        interm_loss = utils.weighted_L1loss(b1_est, b1)
+        # b1_est = c2b(interm_vid)
+        # interm_loss = utils.weighted_L1loss(b1_est, b1)
         # blurred = torch.mean(gt_vid, dim=1, keepdim=True)
         # blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
         # interm_loss = L1loss(blurred_est, blurred)
-        # interm_loss = utils.weighted_L1loss(interm_vid, gt_vid)
+        interm_loss = utils.weighted_L1loss(interm_vid, gt_vid)
         interm_loss_sum += interm_loss.item()
 
         final_loss = utils.weighted_L1loss(highres_vid, gt_vid)
@@ -178,7 +183,7 @@ for i in range(start_epoch, start_epoch+num_epochs):
         tv_loss = utils.gradx(highres_vid).abs().mean() + utils.grady(highres_vid).abs().mean()
         tv_loss_sum += tv_loss.item()
 
-        loss = final_loss + 0.1*tv_loss + interm_loss
+        loss = final_loss + 0.1*tv_loss + 0.5*interm_loss
         # loss = final_loss + 0.1*tv_loss
         loss_sum += loss.item()
 
@@ -187,19 +192,19 @@ for i in range(start_epoch, start_epoch+num_epochs):
         loss.backward()       
         optimizer.step()
 
-        if train_iter % 100 == 0:
+        if train_iter % 1000 == 0:
             logging.info('epoch: %3d \t iter: %5d \t loss: %.4f'%(i, train_iter, loss.item()))
             # print(l1_interm_loss.item(), l1_final_loss.item(), tv_loss.item())
-        if (i % 5 == 0) and (train_iter % 500 == 0):
-            highres_np = highres_vid[0,...].data.cpu().numpy()
-            interm_np = interm_vid[0,...].data.cpu().numpy()
-            gt_np = gt_vid[0,...].data.cpu().numpy()
-            # for frame in range(gt_np.shape[0]):
-            #     utils.save_image(interm_np[frame,...], 
-            #                     os.path.join(save_path, 'images', 'interm_%.3d_%.5d_%.2d.png'%(i, train_iter, frame)))
-            utils.save_gif(interm_np, os.path.join(save_path, 'gifs', 'interm_%.3d_%.5d.gif'%(i, train_iter)))            
-            utils.save_gif(highres_np, os.path.join(save_path, 'gifs', 'highres_%.3d_%.5d.gif'%(i, train_iter)))
-            utils.save_gif(gt_np, os.path.join(save_path, 'gifs', 'gt_%.3d_%.5d.gif'%(i, train_iter)))
+        # if (i % 5 == 0) and (train_iter % 500 == 0):
+        #     highres_np = highres_vid[0,...].data.cpu().numpy()
+        #     interm_np = interm_vid[0,...].data.cpu().numpy()
+        #     gt_np = gt_vid[0,...].data.cpu().numpy()
+        #     # for frame in range(gt_np.shape[0]):
+        #     #     utils.save_image(interm_np[frame,...], 
+        #     #                     os.path.join(save_path, 'images', 'interm_%.3d_%.5d_%.2d.png'%(i, train_iter, frame)))
+        #     utils.save_gif(interm_np, os.path.join(save_path, 'gifs', 'interm_%.3d_%.5d.gif'%(i, train_iter)))            
+        #     utils.save_gif(highres_np, os.path.join(save_path, 'gifs', 'highres_%.3d_%.5d.gif'%(i, train_iter)))
+        #     utils.save_gif(gt_np, os.path.join(save_path, 'gifs', 'gt_%.3d_%.5d.gif'%(i, train_iter)))
 
         train_iter += 1
 
@@ -231,9 +236,12 @@ for i in range(start_epoch, start_epoch+num_epochs):
             for gt_vid in validation_generator:
                 
                 gt_vid = gt_vid.cuda()
-                
-                b1 = c2b(gt_vid) # (N,1,H,W)
-                interm_vid = invNet(b1)               
+                if not args.two_bucket:
+                    b1 = c2b(gt_vid) # (N,1,H,W)
+                    interm_vid = invNet(b1)   
+                else:
+                    b1, b0 = c2b(gt_vid)
+                    interm_vid = invNet(torch.cat([b1,b0], dim=1))            
                 highres_vid = uNet(interm_vid) # (N,9,H,W)
 
                 val_psnr_sum += utils.compute_psnr(highres_vid, gt_vid).item()
@@ -241,24 +249,20 @@ for i in range(start_epoch, start_epoch+num_epochs):
                 
                 psnr = utils.compute_psnr(highres_vid, gt_vid).item() / gt_vid.shape[0]
                 ssim = utils.compute_ssim(highres_vid, gt_vid).item() / gt_vid.shape[0]
-                print('PSNR: %.2f SSIM: %.3f'%(psnr, ssim))
 
                 ## loss
-                b1_est = c2b(interm_vid)
-                interm_loss = utils.weighted_L1loss(b1_est, b1)
+                # b1_est = c2b(interm_vid)
+                # interm_loss = utils.weighted_L1loss(b1_est, b1)
                 # blurred = torch.mean(gt_vid, dim=1, keepdim=True)
                 # blurred_est = torch.mean(interm_vid, dim=1, keepdim=True)
-                # interm_loss = L1loss(blurred_est, blurred)
-                # interm_loss = utils.weighted_L1loss(interm_vid, gt_vid)
-                
+                interm_loss = utils.weighted_L1loss(interm_vid, gt_vid) 
                 final_loss = utils.weighted_L1loss(highres_vid, gt_vid)
-                
                 tv_loss = utils.gradx(highres_vid).abs().mean() + utils.grady(highres_vid).abs().mean()
 
-                val_loss_sum += (interm_loss + final_loss + 0.1*tv_loss).item()
+                val_loss_sum += (final_loss + 0.1*tv_loss + 0.5*interm_loss).item()
                 # val_loss_sum += (final_loss + 0.1*tv_loss).item()
 
-                if val_iter % 100 == 0:
+                if val_iter % 1000 == 0:
                     print('In val iter %d'%(val_iter))
 
                 val_iter += 1

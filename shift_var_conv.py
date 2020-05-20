@@ -40,12 +40,12 @@ class ShiftVarConv2D(nn.Module):
         return nn.Sequential(*layers)
 
 
-    def __init__(self, out_channels=16, block_size=8, two_bucket=False):
+    def __init__(self, out_channels, block_size, window=3, two_bucket=False):
         super(ShiftVarConv2D, self).__init__()
 
         self.block_size = block_size
         self.sub_frames = out_channels
-        self.window = 3
+        self.window = window
         self.two_bucket = two_bucket
 
         self.inverse_layer = self.conv_layer(in_channels=block_size**2, out_channels=out_channels*(block_size**2))

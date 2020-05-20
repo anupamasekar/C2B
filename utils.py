@@ -48,90 +48,54 @@ def weighted_L1loss(pred, target):
     return loss
 
 
-def solve_constraints(b1 ,b0, code, normalize=False):
-    # code (1,9,3,3)
-    code_size = code.shape[-1]
+# def solve_constraints(b1 ,b0, code, normalize=False):
+#     # code (1,9,3,3)
+#     code_size = code.shape[-1]
 
-    vec_filter = np.eye(code_size**2) # 9x9
-    vec_filter = vec_filter.reshape([code_size**2,code_size,code_size]) # 9x3x3
-    vec_filter = vec_filter[:,None,:,:] # 9x1x3x3
-    vec_filter = torch.cuda.FloatTensor(vec_filter) # (9,1,3,3)
+#     vec_filter = np.eye(code_size**2) # 9x9
+#     vec_filter = vec_filter.reshape([code_size**2,code_size,code_size]) # 9x3x3
+#     vec_filter = vec_filter[:,None,:,:] # 9x1x3x3
+#     vec_filter = torch.cuda.FloatTensor(vec_filter) # (9,1,3,3)
 
-    N,_,H,W = b0.size() # (N,1,H,W)
-    # reshaping b1 and b0
-    vec_b1 = F.conv2d(b1, vec_filter, stride=code_size) # (N,9,H/3,W/3)
-    vec_b0 = F.conv2d(b0, vec_filter, stride=code_size) # (N,9,H/3,W/3)
-    b1_b0 = torch.cat([vec_b1,vec_b0], dim=1) # (N,18,H/3,W/3)
-    b1_b0 = b1_b0.view(N,2*code_size**2,-1) # (N,18,H*W/9)
-    b1_b0 = b1_b0.unsqueeze(1) # (N,1,18,H*W/9)
+#     N,_,H,W = b0.size() # (N,1,H,W)
+#     # reshaping b1 and b0
+#     vec_b1 = F.conv2d(b1, vec_filter, stride=code_size) # (N,9,H/3,W/3)
+#     vec_b0 = F.conv2d(b0, vec_filter, stride=code_size) # (N,9,H/3,W/3)
+#     b1_b0 = torch.cat([vec_b1,vec_b0], dim=1) # (N,18,H/3,W/3)
+#     b1_b0 = b1_b0.view(N,2*code_size**2,-1) # (N,18,H*W/9)
+#     b1_b0 = b1_b0.unsqueeze(1) # (N,1,18,H*W/9)
     
-    # code_mat = code.reshape([1,code_size**2,-1]).squeeze(0) # (9,9)
-    code_mat = code.contiguous().view(code_size**2, code_size**2).transpose(0,1)
-    comp_mat = 1. - code_mat
-    code_concat = torch.cat([code_mat,comp_mat], dim=0) # (18,9)
-    code_concat = code_concat / torch.sum(code_concat, dim=1, keepdim=True)
-    # code_concat = code_concat / code.shape[1]
-    code_pinv = torch.pinverse(code_concat, rcond=1e-3) # (9,18)
-    # print(code_pinv.min(), code_pinv.max())
-    inverse_filter = code_pinv.unsqueeze(1).unsqueeze(3) # (9,1,18,1)
+#     # code_mat = code.reshape([1,code_size**2,-1]).squeeze(0) # (9,9)
+#     code_mat = code.contiguous().view(code_size**2, code_size**2).transpose(0,1)
+#     comp_mat = 1. - code_mat
+#     code_concat = torch.cat([code_mat,comp_mat], dim=0) # (18,9)
+#     code_concat = code_concat / torch.sum(code_concat, dim=1, keepdim=True)
+#     # code_concat = code_concat / code.shape[1]
+#     code_pinv = torch.pinverse(code_concat, rcond=1e-3) # (9,18)
+#     # print(code_pinv.min(), code_pinv.max())
+#     inverse_filter = code_pinv.unsqueeze(1).unsqueeze(3) # (9,1,18,1)
     
-    lowRes_vid = F.conv2d(b1_b0, inverse_filter, stride=1) # (N,9,1,H*W/9)
-    lowRes_vid = lowRes_vid.view(N,code_size**2,H//code_size,W//code_size) # (N,9,H/3,W/3)
+#     lowRes_vid = F.conv2d(b1_b0, inverse_filter, stride=1) # (N,9,1,H*W/9)
+#     lowRes_vid = lowRes_vid.view(N,code_size**2,H//code_size,W//code_size) # (N,9,H/3,W/3)
 
-    # normalize
-    if normalize:
-        for i in range(N):
-            lowRes_vid[i] = (lowRes_vid[i]-torch.min(lowRes_vid[i]))/(torch.max(lowRes_vid[i])-torch.min(lowRes_vid[i]))
-    else:
-        lowRes_vid = lowRes_vid.clamp(min=0, max=1)
-    # print(torch.max(lowRes_vid), torch.min(lowRes_vid))
-    return lowRes_vid
-
-
-def single_bucket_to_lowRes(b1, code, normalize=False):
-    # code (1,9,3,3)
-    code_size = code.shape[-1]
-
-    vec_filter = np.eye(code_size**2) # 9x9
-    vec_filter = vec_filter.reshape([code_size**2,code_size,code_size]) # 9x3x3
-    vec_filter = vec_filter[:,None,:,:] # 9x1x3x3
-    vec_filter = torch.cuda.FloatTensor(vec_filter) # (9,1,3,3)
-
-    N,_,H,W = b1.size() # (N,1,H,W)
-    # reshaping b1
-    vec_b1 = F.conv2d(b1, vec_filter, stride=code_size) # (N,9,H/3,W/3)
-    vec_b1 = vec_b1.view(N,code_size**2,-1) # (N,9,H*W/9)
-    vec_b1 = vec_b1.unsqueeze(1) # (N,1,9,H*W/9)
-    
-    # code_mat = code.reshape([1,code_size**2,-1]).squeeze(0) # (9,9)
-    code_mat = code.contiguous().view(code_size**2, code_size**2).transpose(0,1)
-    code_mat = code_mat / torch.sum(code_mat, dim=1, keepdim=True)
-    # code_mat = code_mat / code.shape[1]
-    code_pinv = torch.pinverse(code_mat) # (9,9)
-    inverse_filter = code_pinv.unsqueeze(1).unsqueeze(3) # (9,1,9,1)
-    
-    lowRes_vid = F.conv2d(vec_b1, inverse_filter, stride=1) # (N,9,1,H*W/9)
-    lowRes_vid = lowRes_vid.view(N,code_size**2,H//code_size,W//code_size) # (N,9,H/3,W/3)
-
-    # normalize
-    if normalize:
-        for i in range(N):
-            lowRes_vid[i] = (lowRes_vid[i]-torch.min(lowRes_vid[i]))/(torch.max(lowRes_vid[i])-torch.min(lowRes_vid[i]))
-    else:
-        lowRes_vid = lowRes_vid.clamp(min=0, max=1)
-    # print(torch.max(lowRes_vid), torch.min(lowRes_vid))
-    return lowRes_vid
+#     # normalize
+#     if normalize:
+#         for i in range(N):
+#             lowRes_vid[i] = (lowRes_vid[i]-torch.min(lowRes_vid[i]))/(torch.max(lowRes_vid[i])-torch.min(lowRes_vid[i]))
+#     else:
+#         lowRes_vid = lowRes_vid.clamp(min=0, max=1)
+#     # print(torch.max(lowRes_vid), torch.min(lowRes_vid))
+#     return lowRes_vid
 
 
-def inverse_pixel_shuffle(img, downscale_factor):
+def impulse_inverse(img, block_size):
     # img (N,1,H,W)
-    vec_filter = np.eye(downscale_factor**2)
-    vec_filter = vec_filter.reshape([downscale_factor**2,downscale_factor,downscale_factor])
-    vec_filter = torch.cuda.FloatTensor(vec_filter[:,None,:,:])
-
-    shuffled = F.conv2d(img, vec_filter, stride=downscale_factor) # (N,9,H/3,W/3)
-    return shuffled
-    # output (N,9,H/3,W/3)
+    vec_filter = np.eye(block_size**2)
+    vec_filter = vec_filter.reshape(block_size**2, block_size, block_size)
+    vec_filter = torch.cuda.FloatTensor(vec_filter).unsqueeze(1)
+    out = F.conv2d(img, vec_filter, stride=block_size) # (N,d**2,H/d,W/d)
+    out = F.upsample(out, scale_factor=block_size, mode='bicubic', align_corners=True)
+    return out
 
 
 # def coded_pixel_shuffle(img, code):
