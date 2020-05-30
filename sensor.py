@@ -11,7 +11,7 @@ import scipy.io
 
 class C2B(nn.Module):
     
-    def __init__(self, block_size, sub_frames, mask='random', two_bucket=False):
+    def __init__(self, block_size, sub_frames, mask='random', two_bucket=False, trainable=False):
         super(C2B, self).__init__()
 
         if mask == 'impulse':
@@ -37,17 +37,20 @@ class C2B(nn.Module):
             print('Initialized sensor with random code %dx%dx%d'%(sub_frames, block_size, block_size))
         
         self.block_size = block_size
-        if mask == 'train':
-            self.trainable = True
-        self.code = nn.Parameter(code, requires_grad=self.trainable)
+        self.trainable = trainable
+        self.code = nn.Parameter(code, requires_grad=trainable)
         self.two_bucket = two_bucket
         # self.code_repeat = code.repeat(1, 1, patch_size//block_size, patch_size//block_size)
 
 
     def update_mask(self):
         assert self.trainable
-        code = torch.round(self.code.data)
+        # code = torch.round(torch.clip(self.code.data))
+        code = torch.round((torch.sign(self.code.data) + 1.0) / 2.0)
+        assert torch.max(code) == 1
+        assert torch.min(code) == 0
         self.code.data.copy_(code)
+        return
 
 
     def forward(self, x):
@@ -58,5 +61,5 @@ class C2B(nn.Module):
             return b1
         code_repeat_comp = 1 - code_repeat
         b0 = torch.sum(code_repeat_comp*x, dim=1, keepdim=True) / torch.sum(code_repeat_comp, dim=1, keepdim=True)
-        # blurred = torch.mean(x, dim=1, keepdim=True)
+        # b0 = torch.mean(x, dim=1, keepdim=True)
         return b1, b0 # (N,1,H,W)
